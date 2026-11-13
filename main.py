@@ -1,7 +1,12 @@
+import os
 import httpx
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -13,11 +18,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RELINQ_URL = "https://painel.relinqscore.com.br/api/v2/cpf-relinq-plus/"
-RELINQ_TOKEN = "rsk_a2458eac526b3efc2040758093de9b376b8651904ddf8318197e5e41c9f592f9"
-
+RELINQ_URL = os.getenv("RELINQ_URL")
+RELINQ_TOKEN = os.getenv("RELINQ_TOKEN")
 class ConsultaCPF(BaseModel):
     cpf: str
+
+def calcular_idade_divida(data_str):
+    try:
+        data_obj = datetime.strptime(data_str, "%d/%m/%Y")
+        return (datetime.now() - data_obj).days
+    except:
+        return 0
 
 @app.post("/analisar-cpf/")
 async def analisar_cpf_endpoint(request: ConsultaCPF):
@@ -45,18 +56,18 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
     resumo = consulta_credito.get("resumoConsulta") or {}
     
     # ---------------------------------------------------------
-    # BLOCO FINANCEIRO
+    # EXTRAÇÃO DE DADOS FINANCEIROS
     # ---------------------------------------------------------
     score_obj = consulta_credito.get("score") or {}
     score = score_obj.get("score", 0)
     
-    protestos_obj = resumo.get("protestos") or {}
-    qtd_protestos = protestos_obj.get("quantidadeTotal", 0)
-    
     pendencias_obj = resumo.get("pendenciasFinanceiras") or {}
-    total_pendencias = pendencias_obj.get("valorTotal", 0)
+    total_pendencias = pendencias_obj.get("valorTotal", 0.0)
     
-    teve_atraso_aluguel = False
+    # NOVAS VARIÁVEIS PARA O FILTRO DE LOCADORAS
+    qtd_dividas_locadora = 0
+    palavras_locadora = ["MOTTU", "LOCALIZA", "MOVIDA", "ALUGUEL", "LOCADORA", "LOCACAO"]
+    
     divida_nu = 0.0
     
     lista_pendencias = consulta_credito.get("pendenciasFinanceiras") or []
@@ -65,17 +76,78 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
         tipo = str(p.get("tipoPendencia", "")).upper()
         valor = float(p.get("valor") or 0.0)
         
-        if "MOTTU" in informante or "ALUGUEL" in tipo or "LOCACAO" in tipo:
-            teve_atraso_aluguel = True
+        # Conta quantas dívidas de locadora o cliente possui
+        is_locadora = any(palavra in informante or palavra in tipo for palavra in palavras_locadora)
+        if is_locadora:
+            qtd_dividas_locadora += 1
             
         if "NU " in informante or "NUBANK" in informante:
             divida_nu += valor
 
-    pontos = 0
+    # Para exibir no FrontEnd se teve algum atraso (booleano)
+    teve_atraso_aluguel = qtd_dividas_locadora > 0
+
+    lista_protestos = consulta_credito.get("protestos") or []
+    qtd_protestos = len(lista_protestos)
+    valor_protestos = sum(float(p.get("valor") or 0.0) for p in lista_protestos)
+
+    # ---------------------------------------------------------
+    # MOTOR DE PONTUAÇÃO E REGRAS
+    # ---------------------------------------------------------
+    pontos = 0.0
+
+    # 1. Score Serasa
     if score > 500: pontos += 2
     elif score >= 351: pontos += 1
 
-    status_financeiro = "REPROVADO" if teve_atraso_aluguel else "APROVADO"
+    # 2. Aluguel em Atraso
+    if qtd_dividas_locadora == 0:
+        pontos += 3  # Ganha 3 pontos se não tiver NENHUM registro
+    # Se tiver 1, apenas deixa de ganhar os 3 pontos. 
+    # Se tiver > 1, aplicaremos o Hard Stop mais abaixo.
+
+    # 3. Pendências Financeiras (Valor Total)
+    if total_pendencias <= 3144.96:
+        pontos += 2
+    elif total_pendencias <= 3500.00:
+        pontos += 1
+
+    # 4. Nu Financeira
+    if divida_nu <= 107.40:
+        pontos += 1
+    elif divida_nu <= 500.00:
+        pontos += 0.5
+
+    # 5. Protestos (Quantidade e Tempo)
+    if qtd_protestos == 0:
+        pontos += 1
+    elif qtd_protestos == 1:
+        dias_protesto = calcular_idade_divida(lista_protestos[0].get("data", ""))
+        if dias_protesto > 365:
+            pontos += 0.5
+
+    # 6. Protestos (Porcentagem baseada no Total de Pendências)
+    if total_pendencias > 0:
+        perc_protesto = (valor_protestos / total_pendencias) * 100
+    else:
+        # Se não tem pendências financeiras normais, mas tem protesto, o protesto representa 100% da dívida
+        perc_protesto = 100.0 if valor_protestos > 0 else 0.0
+
+    if perc_protesto < 25.0:
+        pontos += 1
+    elif perc_protesto <= 35.0:
+        pontos += 0.5
+
+    # ---------------------------------------------------------
+    # GATILHOS DE REPROVAÇÃO (HARD STOPS)
+    # ---------------------------------------------------------
+    reprovacao_locadora = qtd_dividas_locadora > 1 # HARD STOP de devedor contumaz de locadora
+    
+    # O cliente precisa de pelo menos 5 pontos para ser aprovado financeiramente
+    if reprovacao_locadora or pontos < 5.0:
+        status_financeiro = "REPROVADO"
+    else:
+        status_financeiro = "APROVADO"
 
     # ---------------------------------------------------------
     # BLOCO JUDICIAL E ANTECEDENTES
@@ -117,7 +189,7 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
                 "tipos_processos": "Ações Cíveis" if qtd_civeis > 0 else "Nenhum",
                 "polaridade_processual": polaridade,
                 "alienacao_fiduciaria": "Não consultado nesta base",
-                "debitos_aluguel": "Sim" if teve_atraso_aluguel else "Não",
+                "debitos_aluguel": f"Sim ({qtd_dividas_locadora} registros)" if teve_atraso_aluguel else "Não",
                 "tem_processo_criminal": tem_criminal,
                 "tempo_processo_criminal": "N/A"
             }
