@@ -1,5 +1,6 @@
 import os
 import httpx
+import unicodedata
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
@@ -19,6 +20,11 @@ app.add_middleware(
 
 RELINQ_URL = (os.getenv("RELINQ_URL") or "").strip()
 RELINQ_TOKEN = (os.getenv("RELINQ_TOKEN") or "").strip()
+
+def normalizar_texto(texto: str) -> str:
+    nfkd = unicodedata.normalize('NFKD', str(texto))
+    sem_acento = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    return sem_acento.upper().strip()
 
 def calcular_idade_divida(data_str):
     try:
@@ -73,20 +79,26 @@ async def analisar_cpf_endpoint(dados: dict = Body(...)):
     total_pendencias = pendencias_obj.get("valorTotal", 0.0)
     
     qtd_dividas_locadora = 0
-    palavras_locadora = ["MOTTU", "LOCALIZA", "MOVIDA", "ALUGUEL", "LOCADORA", "LOCACAO"]
+    palavras_locadora = [
+        "LOCAC", "LOCADOR", "ALUG", "RENT A CAR", "RENTACAR", "FROTAS", "MOBILIDADE",
+        "MOTTU", "LOCALIZA", "MOVIDA", "UNIDAS", "VAMOS", "TURBI", "KAVAK", 
+        "VOU DE MOTO", "VOUDEMOTO", "RAPI", "LEVE MOTOS", "MOTO FACIL", "MOTOFACIL",
+        "HERTZ", "AVIS", "BUDGET"
+    ]
+    
     divida_nu = 0.0
     
     lista_pendencias = consulta_credito.get("pendenciasFinanceiras") or []
     for p in lista_pendencias:
-        informante = str(p.get("informante", "")).upper()
-        tipo = str(p.get("tipoPendencia", "")).upper()
+        informante = normalizar_texto(p.get("informante", ""))
+        tipo = normalizar_texto(p.get("tipoPendencia", ""))
         valor = float(p.get("valor") or 0.0)
         
         is_locadora = any(palavra in informante or palavra in tipo for palavra in palavras_locadora)
         if is_locadora:
             qtd_dividas_locadora += 1
             
-        if "NU " in informante or "NUBANK" in informante:
+        if "NU " in informante or "NUBANK" in informante or "NU PAGAMENTOS" in informante or "NU FINANCEIRA" in informante:
             divida_nu += valor
 
     teve_atraso_aluguel = qtd_dividas_locadora > 0
