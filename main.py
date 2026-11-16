@@ -1,4 +1,5 @@
 import os
+from wsgiref import headers
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +19,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RELINQ_URL = os.getenv("RELINQ_URL")
-RELINQ_TOKEN = os.getenv("RELINQ_TOKEN")
+RELINQ_URL = (os.getenv("RELINQ_URL") or "").strip()
+RELINQ_TOKEN = (os.getenv("RELINQ_TOKEN") or "").strip()
+
+@app.post("/analisar-cpf/")
+async def analisar_cpf_endpoint(request: ConsultaCPF):
+    cpf = request.cpf.strip()
+    
+    headers = {
+        "Authorization": f"Bearer {RELINQ_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    url_final = RELINQ_URL.replace("{cpf}", cpf) if "{cpf}" in RELINQ_URL else f"{RELINQ_URL.rstrip('/')}/{cpf}"
+    
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            response = await client.get(url_final, headers=headers)
+            dados_api = response.json()
+        except Exception as e:
+            return {"erro": f"Falha de conexão com a Relinq: {str(e)}"}
 class ConsultaCPF(BaseModel):
     cpf: str
 
