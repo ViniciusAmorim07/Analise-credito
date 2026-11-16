@@ -1,5 +1,4 @@
 import os
-from wsgiref import headers
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,24 +21,7 @@ app.add_middleware(
 RELINQ_URL = (os.getenv("RELINQ_URL") or "").strip()
 RELINQ_TOKEN = (os.getenv("RELINQ_TOKEN") or "").strip()
 
-@app.post("/analisar-cpf/")
-async def analisar_cpf_endpoint(request: ConsultaCPF):
-    cpf = request.cpf.strip()
-    
-    headers = {
-        "Authorization": f"Bearer {RELINQ_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
-    url_final = RELINQ_URL.replace("{cpf}", cpf) if "{cpf}" in RELINQ_URL else f"{RELINQ_URL.rstrip('/')}/{cpf}"
-    
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            response = await client.get(url_final, headers=headers)
-            dados_api = response.json()
-        except Exception as e:
-            return {"erro": f"Falha de conexão com a Relinq: {str(e)}"}
+# Esta classe garante que o FastAPI leia o {"cpf": "..."} enviado pelo Flutter no Body
 class ConsultaCPF(BaseModel):
     cpf: str
 
@@ -54,15 +36,20 @@ def calcular_idade_divida(data_str):
 async def analisar_cpf_endpoint(request: ConsultaCPF):
     cpf = request.cpf.strip()
     
+    if not RELINQ_URL or not RELINQ_TOKEN:
+        return {"erro": "Variáveis RELINQ_URL ou RELINQ_TOKEN não configuradas no Render."}
+
     headers = {
         "Authorization": f"Bearer {RELINQ_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
     
+    url_final = RELINQ_URL.replace("{cpf}", cpf) if "{cpf}" in RELINQ_URL else f"{RELINQ_URL.rstrip('/')}/{cpf}"
+    
     async with httpx.AsyncClient(timeout=20.0) as client:
         try:
-            response = await client.get(f"{RELINQ_URL}{cpf}", headers=headers)
+            response = await client.get(url_final, headers=headers)
             dados_api = response.json()
         except Exception as e:
             return {"erro": f"Falha de conexão com a Relinq: {str(e)}"}
@@ -84,10 +71,8 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
     pendencias_obj = resumo.get("pendenciasFinanceiras") or {}
     total_pendencias = pendencias_obj.get("valorTotal", 0.0)
     
-    # NOVAS VARIÁVEIS PARA O FILTRO DE LOCADORAS
     qtd_dividas_locadora = 0
     palavras_locadora = ["MOTTU", "LOCALIZA", "MOVIDA", "ALUGUEL", "LOCADORA", "LOCACAO"]
-    
     divida_nu = 0.0
     
     lista_pendencias = consulta_credito.get("pendenciasFinanceiras") or []
@@ -96,7 +81,6 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
         tipo = str(p.get("tipoPendencia", "")).upper()
         valor = float(p.get("valor") or 0.0)
         
-        # Conta quantas dívidas de locadora o cliente possui
         is_locadora = any(palavra in informante or palavra in tipo for palavra in palavras_locadora)
         if is_locadora:
             qtd_dividas_locadora += 1
@@ -104,7 +88,6 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
         if "NU " in informante or "NUBANK" in informante:
             divida_nu += valor
 
-    # Para exibir no FrontEnd se teve algum atraso (booleano)
     teve_atraso_aluguel = qtd_dividas_locadora > 0
 
     lista_protestos = consulta_credito.get("protestos") or []
@@ -122,9 +105,7 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
 
     # 2. Aluguel em Atraso
     if qtd_dividas_locadora == 0:
-        pontos += 3  # Ganha 3 pontos se não tiver NENHUM registro
-    # Se tiver 1, apenas deixa de ganhar os 3 pontos. 
-    # Se tiver > 1, aplicaremos o Hard Stop mais abaixo.
+        pontos += 3
 
     # 3. Pendências Financeiras (Valor Total)
     if total_pendencias <= 3144.96:
@@ -150,7 +131,6 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
     if total_pendencias > 0:
         perc_protesto = (valor_protestos / total_pendencias) * 100
     else:
-        # Se não tem pendências financeiras normais, mas tem protesto, o protesto representa 100% da dívida
         perc_protesto = 100.0 if valor_protestos > 0 else 0.0
 
     if perc_protesto < 25.0:
@@ -161,9 +141,8 @@ async def analisar_cpf_endpoint(request: ConsultaCPF):
     # ---------------------------------------------------------
     # GATILHOS DE REPROVAÇÃO (HARD STOPS)
     # ---------------------------------------------------------
-    reprovacao_locadora = qtd_dividas_locadora > 1 # HARD STOP de devedor contumaz de locadora
+    reprovacao_locadora = qtd_dividas_locadora > 1
     
-    # O cliente precisa de pelo menos 5 pontos para ser aprovado financeiramente
     if reprovacao_locadora or pontos < 5.0:
         status_financeiro = "REPROVADO"
     else:
