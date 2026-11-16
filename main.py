@@ -1,8 +1,7 @@
 import os
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -21,10 +20,6 @@ app.add_middleware(
 RELINQ_URL = (os.getenv("RELINQ_URL") or "").strip()
 RELINQ_TOKEN = (os.getenv("RELINQ_TOKEN") or "").strip()
 
-# Esta classe garante que o FastAPI leia o {"cpf": "..."} enviado pelo Flutter no Body
-class ConsultaCPF(BaseModel):
-    cpf: str
-
 def calcular_idade_divida(data_str):
     try:
         data_obj = datetime.strptime(data_str, "%d/%m/%Y")
@@ -33,11 +28,17 @@ def calcular_idade_divida(data_str):
         return 0
 
 @app.post("/analisar-cpf/")
-async def analisar_cpf_endpoint(request: ConsultaCPF):
-    cpf = request.cpf.strip()
+async def analisar_cpf_endpoint(dados: dict = Body(...)):
+    cpf = str(dados.get("cpf", "")).strip()
     
-    if not RELINQ_URL or not RELINQ_TOKEN:
-        return {"erro": "Variáveis RELINQ_URL ou RELINQ_TOKEN não configuradas no Render."}
+    if not cpf:
+        return {"erro": "CPF não informado."}
+
+    if not RELINQ_URL.startswith("http"):
+        return {"erro": f"RELINQ_URL inválida ou vazia no Render: '{RELINQ_URL}'. Verifique o nome da variável (deve ter underline: RELINQ_URL)."}
+
+    if not RELINQ_TOKEN:
+        return {"erro": "RELINQ_TOKEN vazio no Render."}
 
     headers = {
         "Authorization": f"Bearer {RELINQ_TOKEN}",
