@@ -16,11 +16,4 @@ Este sistema centraliza a operação em uma interface web responsiva que consult
 * **Banco de Dados & Logs:** PostgreSQL via **Supabase**
 * **Integração Externa:** API REST de dados cadastrais, birô de crédito e processos judiciais
 
-
-[Flutter Web (Vercel)] ──(HTTPS + Bearer Token)──> [FastAPI (Render)]
-                                                         │
-                         ┌───────────────────────────────┴───────────────────────────────┐
-                         ▼                                                               ▼
-             [Supabase (PostgreSQL)]                                         [API REST Birô/Judicial]
-        (Auth, Logs & Cache de 60 dias)                                     (Consultada apenas se não
-                                                                             houver cache válido)
+**REPOSITÓRIO DO BACKEND - PYTHON**
