@@ -1,9 +1,14 @@
 import os
+import hmac
+import json
+import time
+import base64
+import hashlib
 import unicodedata
 import httpx
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,7 +25,219 @@ app.add_middleware(
 
 RELINQ_URL = (os.getenv("RELINQ_URL") or "").strip()
 RELINQ_TOKEN = (os.getenv("RELINQ_TOKEN") or "").strip()
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
+AUTH_SECRET = (os.getenv("AUTH_SECRET") or "chave_padrao_trocar_no_render").encode("utf-8")
 
+
+# ---------------------------------------------------------
+# FUNÇÕES DE TOKEN E AUDITORIA (SUPABASE)
+# ---------------------------------------------------------
+def gerar_token_sessao(dados_usuario: dict, validade_horas: int = 12) -> str:
+    payload = {
+        "login": dados_usuario["login"],
+        "nome": dados_usuario["nome"],
+        "perfil": dados_usuario.get("perfil", "vendedor"),
+        "exp": int(time.time()) + (validade_horas * 3600),
+    }
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
+    assinatura = hmac.new(AUTH_SECRET, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{assinatura}"
+
+
+def validar_token_sessao(authorization: str | None) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sessão expirada ou não autenticada. Faça login.")
+    
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        payload_b64, assinatura_recebida = token.split(".")
+        assinatura_esperada = hmac.new(AUTH_SECRET, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+        
+        if not hmac.compare_digest(assinatura_recebida, assinatura_esperada):
+            raise HTTPException(status_code=401, detail="Token inválido.")
+            
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+        if payload.get("exp", 0) < int(time.time()):
+            raise HTTPException(status_code=401, detail="Sessão expirada. Faça login novamente.")
+            
+        return payload
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Falha na validação do acesso.")
+
+
+def supabase_headers() -> dict:
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+async def registrar_log_consulta(usuario: dict, cpf: str, status_geral: str, pontos: float):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    registro = {
+        "usuario_login": usuario["login"],
+        "usuario_nome": usuario["nome"],
+        "cpf_consultado": cpf,
+        "status_geral": status_geral,
+        "pontuacao_financeira": pontos,
+        "custo_consulta": 10.49,
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/logs_consultas",
+                headers=supabase_headers(),
+                json=registro,
+            )
+        except Exception as e:
+            print(f"Aviso: falha ao gravar log no Supabase: {e}")
+
+async def buscar_consulta_recente_60d(cpf: str) -> dict | None:
+    """
+    Verifica no Supabase se existe uma consulta paga (API_RELINQ) para este CPF
+    nos últimos 60 dias.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    limite_60d = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/logs_consultas",
+                headers=supabase_headers(),
+                params={
+                    "cpf_consultado": f"eq.{cpf}",
+                    "origem": "eq.API_RELINQ",
+                    "consultado_em": f"gte.{limite_60d}",
+                    "select": "id,usuario_login,usuario_nome,status_geral,pontuacao_financeira,consultado_em,resultado_json",
+                    "order": "consultado_em.desc",
+                    "limit": "1",
+                },
+            )
+            registros = resp.json() if resp.status_code == 200 else []
+            return registros[0] if registros else None
+        except Exception as e:
+            print(f"Aviso: falha ao verificar cache de 60 dias no Supabase: {e}")
+            return None
+
+
+async def registrar_log_consulta(
+    usuario: dict,
+    cpf: str,
+    status_geral: str,
+    pontos: float,
+    custo: float = 10.49,
+    origem: str = "API_RELINQ",
+    resultado_json: dict | None = None,
+):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+
+    registro = {
+        "usuario_login": usuario["login"],
+        "usuario_nome": usuario["nome"],
+        "cpf_consultado": cpf,
+        "status_geral": status_geral,
+        "pontuacao_financeira": pontos,
+        "custo_consulta": custo,
+        "origem": origem,
+        "resultado_json": resultado_json,
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/logs_consultas",
+                headers=supabase_headers(),
+                json=registro,
+            )
+        except Exception as e:
+            print(f"Aviso: falha ao gravar log no Supabase: {e}")            
+
+
+# ---------------------------------------------------------
+# ROTA DE LOGIN
+# ---------------------------------------------------------
+@app.post("/login/")
+async def login_endpoint(dados: dict = Body(...)):
+    login_input = str(dados.get("login", "")).strip().lower()
+    senha_input = str(dados.get("senha", "")).strip()
+
+    if not login_input or not senha_input:
+        raise HTTPException(status_code=400, detail="Informe login e senha.")
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Banco de autenticação não configurado no servidor.")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/usuarios",
+            headers=supabase_headers(),
+            params={"login": f"eq.{login_input}", "select": "id,nome,login,senha,perfil,ativo"},
+        )
+
+    usuarios = resp.json() if resp.status_code == 200 else []
+    if not usuarios:
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos.")
+
+    user = usuarios[0]
+    if not user.get("ativo"):
+        raise HTTPException(status_code=403, detail="Usuário bloqueado. Contate o administrador.")
+
+    if user.get("senha") != senha_input:
+        raise HTTPException(status_code=401, detail="Login ou senha incorretos.")
+
+    token = gerar_token_sessao(user)
+    return {
+        "token": token,
+        "usuario": {
+            "nome": user["nome"],
+            "login": user["login"],
+            "perfil": user.get("perfil", "vendedor"),
+        },
+    }
+
+
+# ---------------------------------------------------------
+# ROTA DE CONSULTA DE LOGS (APENAS ADMIN)
+# ---------------------------------------------------------
+@app.get("/logs/")
+async def listar_logs_endpoint(authorization: str | None = Header(default=None)):
+    usuario = validar_token_sessao(authorization)
+    if usuario.get("perfil") != "admin":
+        raise HTTPException(status_code=403, detail="Acesso restrito ao administrador.")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/logs_consultas",
+            headers=supabase_headers(),
+            params={
+                "select": "id,usuario_login,usuario_nome,cpf_consultado,status_geral,pontuacao_financeira,custo_consulta,origem,consultado_em",
+                "order": "consultado_em.desc",
+                "limit": "300",
+            },
+        )
+
+    logs = resp.json() if resp.status_code == 200 else []
+    consultas_pagas = [l for l in logs if l.get("origem") == "API_RELINQ"]
+    consultas_bloqueadas = [l for l in logs if l.get("origem") == "BLOQUEIO_60D_CACHE"]
+
+    total_gasto = round(sum(float(item.get("custo_consulta") or 0.0) for item in logs), 2)
+    total_economizado = round(len(consultas_bloqueadas) * 10.49, 2)
+
+    return {
+        "total_consultas_pagas": len(consultas_pagas),
+        "total_bloqueios_60d": len(consultas_bloqueadas),
+        "custo_total_brl": total_gasto,
+        "economia_total_brl": total_economizado,
+        "logs": logs,
+    }
 
 def normalizar_texto(texto: str) -> str:
     nfkd = unicodedata.normalize("NFKD", str(texto or ""))
@@ -244,12 +461,67 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
 
 
 @app.post("/analisar-cpf/")
-async def analisar_cpf_endpoint(dados: dict = Body(...)):
+async def analisar_cpf_endpoint(
+    dados: dict = Body(...),
+    authorization: str | None = Header(default=None),
+):
+    usuario_logado = validar_token_sessao(authorization)
     cpf = "".join(filter(str.isdigit, str(dados.get("cpf", ""))))
 
     if not cpf:
         return {"erro": "CPF não informado."}
 
+    # ---------------------------------------------------------
+    # TRAVA DE 60 DIAS (Evita cobrar R$ 10,49 novamente na Relinq)
+    # ---------------------------------------------------------
+    consulta_anterior = await buscar_consulta_recente_60d(cpf)
+    if consulta_anterior:
+        dt_orig = datetime.fromisoformat(
+            str(consulta_anterior["consultado_em"]).replace("Z", "+00:00")
+        )
+        dias_passados = (datetime.now(timezone.utc) - dt_orig).days
+        dias_restantes = max(1, 60 - dias_passados)
+        data_br = dt_orig.astimezone(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y às %H:%M")
+
+        # Registra no log que o vendedor tentou consultar (com custo R$ 0,00)
+        await registrar_log_consulta(
+            usuario=usuario_logado,
+            cpf=cpf,
+            status_geral=consulta_anterior.get("status_geral", "N/A"),
+            pontos=float(consulta_anterior.get("pontuacao_financeira") or 0.0),
+            custo=0.00,
+            origem="BLOQUEIO_60D_CACHE",
+            resultado_json=None,
+        )
+
+        resultado_salvo = consulta_anterior.get("resultado_json") or {}
+        if resultado_salvo:
+            resultado_salvo["consultado_por"] = usuario_logado["nome"]
+            resultado_salvo["bloqueio_60_dias"] = {
+                "ativo": True,
+                "mensagem": (
+                    f"Nova consulta na Relinq bloqueada (regra de 60 dias). "
+                    f"Exibindo análise realizada em {data_br} por {consulta_anterior['usuario_nome']}. "
+                    f"Liberação para nova consulta em {dias_restantes} dia(s)."
+                ),
+                "data_original": data_br,
+                "consultado_por_original": consulta_anterior["usuario_nome"],
+                "dias_restantes": dias_restantes,
+                "economia_brl": 10.49,
+            }
+            return resultado_salvo
+
+        return {
+            "erro": (
+                f"CPF já consultado em {data_br} por {consulta_anterior['usuario_nome']} "
+                f"(Resultado: {consulta_anterior.get('status_geral')}). "
+                f"Nova consulta bloqueada por mais {dias_restantes} dia(s)."
+            )
+        }
+
+    # ---------------------------------------------------------
+    # SE NÃO HOUVE CONSULTA NOS ÚLTIMOS 60 DIAS, CHAMA A RELINQ
+    # ---------------------------------------------------------
     if not RELINQ_URL.startswith("http"):
         return {"erro": "RELINQ_URL inválida ou não configurada no servidor."}
 
@@ -436,9 +708,15 @@ async def analisar_cpf_endpoint(dados: dict = Body(...)):
         if (status_financeiro == "REPROVADO" or status_judicial == "REPROVADO")
         else "APROVADO"
     )
-
-    return {
+   
+        
+    resposta_final = {
         "status_geral": status_geral,
+        "consultado_por": usuario_logado["nome"],
+        "bloqueio_60_dias": {
+            "ativo": False,
+            "mensagem": "Consulta nova realizada na base Relinq.",
+        },
         "serasa": {
             "status": status_financeiro,
             "pontuacao_total": pontos,
@@ -465,3 +743,18 @@ async def analisar_cpf_endpoint(dados: dict = Body(...)):
             },
         },
     }
+
+    # Salva no Supabase com o JSON completo para reaproveitar pelos próximos 60 dias
+    await registrar_log_consulta(
+        usuario=usuario_logado,
+        cpf=cpf,
+        status_geral=status_geral,
+        pontos=pontos,
+        custo=10.49,
+        origem="API_RELINQ",
+        resultado_json=resposta_final,
+    )
+
+    return resposta_final
+
+  
