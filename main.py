@@ -386,15 +386,29 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         else "Simples"
     )
 
-    # 6. Verificação Lei nº 9.099/1995 (Infração de Menor Potencial Ofensivo)
-    crimes_menor_potencial = [
-        "VIAS DE FATO", "AMEACA", "LESAO CORPORAL LEVE", "LESAO CORPORAL CULPOSA",
-        "INJURIA", "CALUNIA", "DIFAMACAO", "DESACATO", "DESOBEDIENCIA",
-        "PERTURBACAO DO SOSSEGO", "POSSE DE DROGAS PARA CONSUMO", "USO DE DROGAS",
-        "CONSTRANGIMENTO ILEGAL", "DANO SIMPLES", "DIRECAO PERIGOSA", "DIRIGIR SEM HABILITACAO"
+    # 6. Lista de Crimes Imperdoáveis (Risco direto à vida, liberdade ou ao patrimônio/frota)
+    crimes_imperdoaveis = [
+        # Contra a vida, integridade física grave e liberdade
+        "HOMICIDIO", "FEMINICIDIO", "LATROCINIO", "SEQUESTRO", "CARCERE PRIVADO",
+        "EXTORSAO MEDIANTE SEQUESTRO", "LESAO CORPORAL GRAVE", "LESAO CORPORAL GRAVISSIMA",
+        "ESTUPRO",
+        # Contra o patrimônio e fraudes veiculares (risco direto às motos)
+        "ROUBO", "FURTO", "ESTELIONATO", "APROPRIACAO INDEBITA",
+        "RECEPTACAO", "EXTORSAO", "ADULTERACAO DE SINAL IDENTIFICADOR",
+        # Alta periculosidade, armamento e tráfico
+        "TRAFICO DE DROGAS", "ORGANIZACAO CRIMINOSA", "ASSOCIACAO CRIMINOSA",
+        "PORTE ILEGAL DE ARMA", "POSSE IRREGULAR DE ARMA", "LAVAGEM DE DINHEIRO"
     ]
+
+    
+    eh_crime_imperdoavel = (
+        (elemento_subjetivo == "Doloso" and any(c in texto_assuntos for c in crimes_imperdoaveis))
+        or modalidade == "Qualificado"
+    )
+
+    # 7. Verificação Lei nº 9.099/1995 (Infração de Menor Potencial Ofensivo)
     eh_lei_9099 = (
-        modalidade == "Simples"
+        not eh_crime_imperdoavel
         and (
             "JUIZADO ESPECIAL" in orgao_julgador
             or "JECRIM" in orgao_julgador
@@ -402,11 +416,10 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
             or "MENOR POTENCIAL OFENSIVO" in base_completa
             or "9.099" in base_completa
             or "9099" in base_completa
-            or any(c in texto_assuntos for c in crimes_menor_potencial)
         )
     )
 
-    # 7. Verificação Temporal (> 5 anos) e Status (Extinto / Encerrado / Sem movimentação)
+    # 8. Verificação Temporal (> 5 anos) e Status (Extinto / Encerrado)
     status_pj = proc.get("statusPj") or {}
     status_proc = normalizar_texto(status_pj.get("statusProcesso", ""))
     status_obs = normalizar_texto(proc.get("statusObservacao", ""))
@@ -425,22 +438,22 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
     anos_decorridos = round((datetime.now() - data_ref).days / 365.25, 1) if data_ref else 0.0
     mais_de_5_anos = anos_decorridos > 5.0
 
-    # 8. Decisão Final da Matriz Jurídica
-    if eh_lei_9099:
-        decisao = "APONTAMENTO"
-        motivo_regra = "Infração de menor potencial ofensivo (Lei nº 9.099/1995) — Apontamento sem reprovação automática"
-    elif mais_de_5_anos and esta_encerrado:
-        if elemento_subjetivo == "Doloso" or modalidade == "Qualificado" or natureza == "Contra a Pessoa":
-            decisao = "REPROVADO"
-            motivo_regra = f"Crime > 5 anos encerrado, mas enquadrado na exceção ({natureza} / {elemento_subjetivo} / {modalidade})"
-        else:
-            decisao = "APONTAMENTO"
-            motivo_regra = "Crime > 5 anos extinto/encerrado (Culposo/Simples fora de crime contra a pessoa) — Apontamento sem reprovação"
-    else:
+    # 9. Decisão Final da Matriz Jurídica
+    if eh_crime_imperdoavel:
         decisao = "REPROVADO"
-        motivo_regra = f"Processo criminal ativo ou recente ({status_proc or 'Em andamento'})"
-
-    resumo_classificacao = f"{assunto_principal} ({natureza} | {elemento_subjetivo} | {modalidade})"
+        if mais_de_5_anos and esta_encerrado:
+            motivo_regra = f"Crime grave/imperdoável ({assunto_principal}) — bloqueio mantido mesmo após 5 anos"
+        else:
+            motivo_regra = f"Crime grave/imperdoável ({assunto_principal}) — reprovação automática"
+    elif eh_lei_9099:
+        decisao = "APONTAMENTO"
+        motivo_regra = f"Infração de menor potencial ofensivo / Lei 9.099 ({assunto_principal}) — apenas apontamento"
+    elif mais_de_5_anos and esta_encerrado:
+        decisao = "APONTAMENTO"
+        motivo_regra = f"Processo encerrado há {anos_decorridos} anos ({assunto_principal}) — sem reprovação automática"
+    else:
+        decisao = "APONTAMENTO"
+        motivo_regra = f"Ocorrência fora da lista de crimes graves ({assunto_principal}) — gerado apontamento para análise"
 
     return {
         "ignorar": False,
@@ -457,6 +470,92 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         "decisao": decisao,
         "motivo_regra": motivo_regra,
         "resumo_classificacao": resumo_classificacao,
+    }
+
+def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
+    """
+    Analisa processos cíveis para identificar polo passivo, status ativo
+    e registros de Alienação Fiduciária distribuídos há menos de 5 anos.
+    """
+    status_pj = proc.get("statusPj") or {}
+    status_proc = normalizar_texto(status_pj.get("statusProcesso", ""))
+    status_obs = normalizar_texto(proc.get("statusObservacao", ""))
+    status_unificado = f"{status_proc} {status_obs}".strip()
+
+    esta_arquivado = (
+        any(t in status_unificado for t in ["ARQUIVAD", "EXTINT", "BAIXAD", "ENCERRAD"])
+        and "TRAMITACAO" not in status_unificado
+    )
+
+    # 1. Verifica se o consultado está no polo passivo (réu/devedor/requerido)
+    infos_parte = proc.get("informacoesPartePessoaConsultada") or []
+    tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or [])]
+
+    polos_passivos = {"PASSIVO", "REU", "EXECUTADO", "REQUERIDO", "DEVEDOR", "DEMANDADO"}
+    eh_passivo = False
+    eh_somente_ativo = False
+
+    for info in infos_parte:
+        polo = normalizar_texto(info.get("polo", ""))
+        tipo = normalizar_texto(info.get("tipo", ""))
+        if polo == "PASSIVO" or tipo in polos_passivos:
+            eh_passivo = True
+        elif polo == "ATIVO":
+            eh_somente_ativo = True
+
+    if not eh_passivo and any(t in polos_passivos for t in tipos_parte):
+        eh_passivo = True
+
+    
+    if not eh_passivo and not eh_somente_ativo and not infos_parte and not tipos_parte:
+        for parte in (proc.get("partes") or []):
+            doc_parte = "".join(filter(str.isdigit, str(parte.get("cpf", ""))))
+            if doc_parte == cpf_consultado:
+                polo_p = normalizar_texto(parte.get("polo", ""))
+                tipo_p = normalizar_texto(parte.get("tipo", ""))
+                if polo_p == "PASSIVO" or tipo_p in polos_passivos:
+                    eh_passivo = True
+                elif polo_p == "ATIVO":
+                    eh_somente_ativo = True
+
+    # 2. Verifica Alienação Fiduciária
+    assuntos = proc.get("assuntosCNJ") or []
+    titulos_assuntos = [normalizar_texto(a.get("titulo", "")) for a in assuntos if a.get("titulo")]
+    codigos_assuntos = {str(a.get("codigo", "")).strip() for a in assuntos if a.get("codigo")}
+    classe_nome = normalizar_texto((proc.get("classeProcessual") or {}).get("nome", ""))
+
+    texto_busca = f"{' | '.join(titulos_assuntos)} {classe_nome}"
+    codigos_alienacao = {"9582", "10435"}  # Códigos CNJ de Alienação Fiduciária / Busca e Apreensão
+
+    tem_termo_alienacao = (
+        "ALIENACAO FIDUCIARIA" in texto_busca
+        or bool(codigos_assuntos.intersection(codigos_alienacao))
+    )
+
+    data_ref = parse_data_flexivel(proc.get("dataDistribuicao") or proc.get("dataAutuacao") or "")
+    anos_decorridos = round((datetime.now() - data_ref).days / 365.25, 1) if data_ref else 0.0
+    menos_de_5_anos = anos_decorridos < 5.0
+
+    # Gera apontamento se for Alienação Fiduciária < 5 anos e o cliente não for apenas o credor/autor
+    apontar_alienacao = tem_termo_alienacao and menos_de_5_anos and (eh_passivo or not eh_somente_ativo)
+
+    descricao_alienacao = None
+    if apontar_alienacao:
+        assunto_princ = next(
+            (a.get("titulo") for a in assuntos if a.get("principal") and a.get("titulo")),
+            (proc.get("classeProcessual") or {}).get("nome") or "Alienação Fiduciária",
+        )
+        status_legivel = status_proc or "EM TRAMITACAO"
+        descricao_alienacao = (
+            f"Alienação Fiduciária (< 5 anos): {assunto_princ} "
+            f"({anos_decorridos} anos • {status_legivel})"
+        )
+
+    return {
+        "esta_arquivado": esta_arquivado,
+        "eh_passivo": eh_passivo,
+        "apontar_alienacao": apontar_alienacao,
+        "descricao_alienacao": descricao_alienacao,
     }
 
 
@@ -644,12 +743,12 @@ async def analisar_cpf_endpoint(
 
     processos_civeis_ativos = []
     analises_criminais = []
+    apontamentos_alienacao = []
     tem_polo_passivo_civel = False
 
     for proc in todos_processos:
         area = normalizar_texto(proc.get("area", ""))
         ramo = normalizar_texto((proc.get("statusPj") or {}).get("ramoDireito", ""))
-        status_p = normalizar_texto((proc.get("statusPj") or {}).get("statusProcesso", ""))
 
         eh_criminal = "CRIMINAL" in area or "PENAL" in ramo
 
@@ -658,19 +757,28 @@ async def analisar_cpf_endpoint(
             if not resultado_crim.get("ignorar"):
                 analises_criminais.append(resultado_crim)
         else:
-            esta_arquivado = "ARQUIVAD" in status_p or "EXTINT" in status_p or "BAIXAD" in status_p
-            if not esta_arquivado:
+            resultado_civel = analisar_processo_civel(proc, cpf)
+            if not resultado_civel["esta_arquivado"]:
                 processos_civeis_ativos.append(proc)
-                infos_p = proc.get("informacoesPartePessoaConsultada") or []
-                if any(normalizar_texto(i.get("polo", "")) == "PASSIVO" for i in infos_p):
+                if resultado_civel["eh_passivo"]:
                     tem_polo_passivo_civel = True
+
+            if resultado_civel["apontar_alienacao"] and resultado_civel["descricao_alienacao"]:
+                apontamentos_alienacao.append(resultado_civel["descricao_alienacao"])
 
     reprovados_criminais = [c for c in analises_criminais if c["decisao"] == "REPROVADO"]
     apontamentos_criminais = [c for c in analises_criminais if c["decisao"] == "APONTAMENTO"]
 
     status_judicial = "REPROVADO" if len(reprovados_criminais) > 0 else "APROVADO"
 
-    # Formatação para os campos exibidos na interface
+    todos_apontamentos = [c["motivo_regra"] for c in apontamentos_criminais] + apontamentos_alienacao
+
+    alienacao_texto = (
+        f"Sim ({len(apontamentos_alienacao)} registro(s) < 5 anos)"
+        if apontamentos_alienacao
+        else "Não"
+    )
+
     qtd_total_processos = len(processos_civeis_ativos) + len(analises_criminais)
 
     if reprovados_criminais:
@@ -699,7 +807,6 @@ async def analisar_cpf_endpoint(
         if (len(analises_criminais) > 0 or tem_polo_passivo_civel)
         else ("Ativo" if processos_civeis_ativos else "Nenhum")
     )
-
     # ---------------------------------------------------------
     # 3. PARECER FINAL
     # ---------------------------------------------------------
@@ -734,11 +841,11 @@ async def analisar_cpf_endpoint(
                 "qtd_processos": qtd_total_processos,
                 "tipos_processos": tipos_processos_texto,
                 "polaridade_processual": polaridade,
-                "alienacao_fiduciaria": "Não consultado nesta base",
+                "alienacao_fiduciaria": alienacao_texto,
                 "debitos_aluguel": f"Sim ({qtd_dividas_locadora} registros)" if teve_atraso_aluguel else "Não",
                 "tem_processo_criminal": tem_criminal_texto,
                 "tempo_processo_criminal": tempo_criminal_texto,
-                "apontamentos_judiciais": [c["motivo_regra"] for c in apontamentos_criminais],
+                "apontamentos_judiciais": todos_apontamentos,
                 "classificacao_criminal": analises_criminais,
             },
         },
