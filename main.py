@@ -806,6 +806,8 @@ async def analisar_cpf_endpoint(
     status_judicial = "REPROVADO" if len(reprovados_criminais) > 0 else "APROVADO"
 
     todos_apontamentos = [c["motivo_regra"] for c in apontamentos_criminais] + apontamentos_alienacao
+    if processos_civeis_ativos:
+        todos_apontamentos.append(f"Processos cíveis ativos: {len(processos_civeis_ativos)} registro(s)")
 
     alienacao_texto = (
         f"Sim ({len(apontamentos_alienacao)} registro(s) < 5 anos)"
@@ -825,13 +827,8 @@ async def analisar_cpf_endpoint(
     if analises_criminais:
         mais_grave = reprovados_criminais[0] if reprovados_criminais else apontamentos_criminais[0]
         tempo_criminal_texto = f"{mais_grave['anos_decorridos']} anos ({mais_grave['status_processo']})"
-        tipos_listados = [c["resumo_classificacao"] for c in analises_criminais]
-        if processos_civeis_ativos:
-            tipos_listados.append(f"Cível ({len(processos_civeis_ativos)} ativos)")
-        tipos_processos_texto = " | ".join(tipos_listados)
-    elif processos_civeis_ativos:
-        tempo_criminal_texto = "N/A"
-        tipos_processos_texto = f"Ações Cíveis ({len(processos_civeis_ativos)} ativos)"
+        crimes_unicos = list(dict.fromkeys(c["assunto"] for c in analises_criminais if c.get("assunto")))
+        tipos_processos_texto = ", ".join(crimes_unicos) if crimes_unicos else "Criminal"
     else:
         tempo_criminal_texto = "N/A"
         tipos_processos_texto = "Nenhum"
