@@ -244,6 +244,20 @@ def normalizar_texto(texto: str) -> str:
     sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
     return sem_acento.upper().strip()
 
+def formatar_moeda_brl(valor) -> str:
+    try:
+        if isinstance(valor, str):
+            limpo = valor.replace("R$", "").strip()
+            if "," in limpo and "." in limpo:
+                limpo = limpo.replace(".", "").replace(",", ".")
+            elif "," in limpo:
+                limpo = limpo.replace(",", ".")
+            numero = float(limpo)
+        else:
+            numero = float(valor or 0)
+    except (ValueError, TypeError):
+        numero = 0.0
+    return f"R$ {numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def parse_data_flexivel(data_str: str):
     if not data_str:
@@ -299,7 +313,6 @@ def extrair_processos_unicos(dados_data: dict) -> list:
 
 
 def extrair_texto_campo(obj, chave: str, padrao: str = "") -> str:
-    """Lê uma chave se obj for dict, ou retorna o próprio texto se obj vier como str."""
     if isinstance(obj, dict):
         return str(obj.get(chave) or padrao)
     if isinstance(obj, str):
@@ -485,10 +498,6 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
 
 
 def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
-    """
-    Analisa processos cíveis para identificar polo passivo, status ativo
-    e registros de Alienação Fiduciária distribuídos há menos de 5 anos.
-    """
     if not isinstance(proc, dict):
         return {"esta_arquivado": True, "eh_passivo": False, "apontar_alienacao": False, "descricao_alienacao": None}
 
@@ -696,6 +705,7 @@ async def analisar_cpf_endpoint(
     total_pendencias = pendencias_obj.get("valorTotal", 0.0)
 
     qtd_dividas_locadora = 0
+    dividas_locadora_lista = []
     palavras_locadora = [
         "LOCAC", "LOCADOR", "ALUG", "RENT A CAR", "RENTACAR", "FROTAS", "MOBILIDADE",
         "MOTTU", "LOCALIZA", "MOVIDA", "UNIDAS", "VAMOS", "TURBI", "KAVAK",
@@ -703,24 +713,29 @@ async def analisar_cpf_endpoint(
         "LOCA SIM", "LOCASIM", "LOCA9", "MOTOCA", "HERTZ", "AVIS", "BUDGET"
     ]
     divida_nu = 0.0
-
     lista_pendencias = consulta_credito.get("pendenciasFinanceiras") or []
     for p in lista_pendencias:
-        informante = normalizar_texto(p.get("informante", ""))
-        tipo = normalizar_texto(p.get("tipoPendencia", ""))
-        valor = float(p.get("valor") or 0.0)
+        if not isinstance(p, dict):
+            continue
+
+        informante_original = str(p.get("informante") or "Empresa não informada").strip()
+        informante = normalizar_texto(informante_original)
+        tipo = normalizar_texto(str(p.get("tipoPendencia") or ""))
+        valor = float(p.get("valor") or p.get("valorPendencia") or 0.0)
 
         if any(palavra in informante or palavra in tipo for palavra in palavras_locadora):
             qtd_dividas_locadora += 1
+            dividas_locadora_lista.append(f"{informante_original} ({formatar_moeda_brl(valor)})")
 
         if any(nu in informante for nu in ["NU ", "NUBANK", "NU PAGAMENTOS", "NU FINANCEIRA"]):
             divida_nu += valor
 
     teve_atraso_aluguel = qtd_dividas_locadora > 0
+    atraso_aluguel_texto = " | ".join(dividas_locadora_lista) if dividas_locadora_lista else "Não"
 
     lista_protestos = consulta_credito.get("protestos") or []
     qtd_protestos = len(lista_protestos)
-    valor_protestos = sum(float(p.get("valor") or 0.0) for p in lista_protestos)
+    valor_protestos = sum(float(p.get("valor") or 0.0) for p in lista_protestos if isinstance(p, dict))
 
     pontos = 0.0
 
@@ -860,7 +875,7 @@ async def analisar_cpf_endpoint(
             "pontuacao_total": pontos,
             "detalhes": {
                 "score": score,
-                "teve_atraso_aluguel": teve_atraso_aluguel,
+                "atraso_aluguel": atraso_aluguel_texto,
                 "divida_nu_financeira": round(divida_nu, 2),
                 "qtd_protestos": qtd_protestos,
                 "total_pendencias": round(total_pendencias, 2),
