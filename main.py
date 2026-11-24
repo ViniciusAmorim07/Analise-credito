@@ -299,108 +299,86 @@ def extrair_processos_unicos(dados_data: dict) -> list:
 
 
 def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
-    # 1. Verificação de Responsabilidade (Polo Passivo ou Ativo)
+    """
+    Classifica processos criminais com base na Tabela Unificada do CNJ,
+    separando crimes imperdoáveis de apontamentos (Lei 9.099 / >5 anos).
+    """
+    # 1. Verifica se o consultado figura no polo passivo (réu/indiciado/investigado)
     infos_parte = proc.get("informacoesPartePessoaConsultada") or []
     tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or [])]
 
-    polos_passivos_validos = {
-        "PASSIVO", "AVERIGUADO", "INDICIADO", "REU", "AUTOR DO FATO",
-        "INVESTIGADO", "ACUSADO", "CONDENADO", "EXECUTADO", "FLAGRANTEADO"
+    polos_passivos = {
+        "PASSIVO", "REU", "INDICIADO", "INVESTIGADO",
+        "DENUNCIADO", "ACUSADO", "AUTOR DO FATO", "FLAGRANTEADO"
     }
-    polos_excluidos = {"VITIMA", "TESTEMUNHA", "TERCEIRO", "ADVOGADO", "PERITO"}
-
     eh_passivo = False
-    papel_desc = "Não identificado"
+    eh_vitima_ou_outro = False
 
     for info in infos_parte:
         polo = normalizar_texto(info.get("polo", ""))
         tipo = normalizar_texto(info.get("tipo", ""))
-        if polo == "PASSIVO" or tipo in polos_passivos_validos:
+        if polo == "PASSIVO" or tipo in polos_passivos:
             eh_passivo = True
-            papel_desc = f"Passivo ({tipo or 'Réu/Averiguado'})"
-            break
-        if tipo in polos_excluidos:
-            papel_desc = tipo
+        elif polo == "ATIVO" or tipo in {"VITIMA", "TESTEMUNHA", "OFENDIDO", "NOTICIANTE"}:
+            eh_vitima_ou_outro = True
 
-    if not eh_passivo and any(t in polos_passivos_validos for t in tipos_parte):
+    if not eh_passivo and any(t in polos_passivos for t in tipos_parte):
         eh_passivo = True
-        papel_desc = f"Passivo ({', '.join(tipos_parte)})"
 
-    # Fallback olhando a lista completa de partes pelo CPF
-    if not eh_passivo and not infos_parte and not tipos_parte:
-        for parte in (proc.get("partes") or []):
-            doc_parte = "".join(filter(str.isdigit, str(parte.get("cpf", ""))))
-            if doc_parte == cpf_consultado:
-                polo_p = normalizar_texto(parte.get("polo", ""))
-                tipo_p = normalizar_texto(parte.get("tipo", ""))
-                if polo_p == "PASSIVO" or tipo_p in polos_passivos_validos:
-                    eh_passivo = True
-                    papel_desc = f"Passivo ({tipo_p or 'Réu/Averiguado'})"
-                elif tipo_p in polos_excluidos:
-                    papel_desc = tipo_p
+    if not eh_passivo and eh_vitima_ou_outro:
+        return {"ignorar": True}
 
-    if not eh_passivo:
-        return {"ignorar": True, "motivo": f"Consultado figura como {papel_desc}"}
-
-    # 2. Extração de Assuntos CNJ, Classe e Órgão Julgador
+    # 2. Extração dos assuntos CNJ, classe e órgão julgador
     assuntos = proc.get("assuntosCNJ") or []
     titulos_assuntos = [normalizar_texto(a.get("titulo", "")) for a in assuntos if a.get("titulo")]
     codigos_assuntos = {str(a.get("codigo", "")).strip() for a in assuntos if a.get("codigo")}
-    texto_assuntos = " | ".join(titulos_assuntos)
 
     assunto_principal = next(
         (a.get("titulo") for a in assuntos if a.get("principal") and a.get("titulo")),
-        assuntos[0].get("titulo") if assuntos else "Natureza Criminal"
+        (assuntos[0].get("titulo") if assuntos else None)
+        or (proc.get("classeProcessual") or {}).get("nome")
+        or "Assunto não especificado",
     )
 
     classe_nome = normalizar_texto((proc.get("classeProcessual") or {}).get("nome", ""))
-    orgao_julgador = normalizar_texto(proc.get("orgaoJulgador", ""))
+    orgao_julgador = normalizar_texto((proc.get("orgaoJulgador") or {}).get("nome", ""))
+    texto_assuntos = " | ".join(titulos_assuntos) if titulos_assuntos else normalizar_texto(assunto_principal)
     base_completa = f"{texto_assuntos} {classe_nome} {orgao_julgador}"
 
-    # 3. Classificação: Contra a Pessoa vs Contra o Patrimônio vs Outros
+    # 3. Classificação da Natureza Jurídica (apenas para exibição no relatório)
     termos_pessoa = [
-        "CONTRA A PESSOA", "HOMICIDIO", "LESAO CORPORAL", "AMEACA", "CALUNIA",
-        "INJURIA", "DIFAMACAO", "SEQUESTRO", "CARCERE PRIVADO", "CONSTRANGIMENTO ILEGAL",
-        "VIOLENCIA DOMESTICA", "FEMINICIDIO", "VIAS DE FATO", "MAUS TRATOS",
-        "PERICLITACAO DA VIDA", "ABORTO", "INFANTICIDIO"
+        "CONTRA A PESSOA", "HOMICIDIO", "FEMINICIDIO", "LESAO CORPORAL",
+        "AMEACA", "CALUNIA", "INJURIA", "DIFAMACAO", "SEQUESTRO",
+        "CARCERE PRIVADO", "VIOLENCIA DOMESTICA", "MAUS TRATOS", "ABORTO", "INFANTICIDIO"
     ]
     termos_patrimonio = [
-        "CONTRA O PATRIMONIO", "ESTELIONATO", "FURTO", "ROUBO", "APROPRIACAO INDEBITA",
-        "RECEPTACAO", "EXTORSAO", "DANO", "USURPACAO", "LATROCINIO", "FRAUDE"
+        "CONTRA O PATRIMONIO", "ROUBO", "FURTO", "ESTELIONATO",
+        "APROPRIACAO INDEBITA", "RECEPTACAO", "EXTORSAO", "DANO"
     ]
 
     if "3369" in codigos_assuntos or any(t in texto_assuntos for t in termos_pessoa):
         natureza = "Contra a Pessoa"
-    elif "3415" in codigos_assuntos or "3431" in codigos_assuntos or any(t in texto_assuntos for t in termos_patrimonio):
+    elif "3415" in codigos_assuntos or any(t in texto_assuntos for t in termos_patrimonio):
         natureza = "Contra o Patrimônio"
     else:
         natureza = "Outros Bens Jurídicos"
 
-    # 4. Classificação: Doloso vs Culposo
-    elemento_subjetivo = "Culposo" if "CULPOS" in texto_assuntos else "Doloso"
+    # 4. Elemento Subjetivo (Doloso vs Culposo)
+    elemento_subjetivo = "Culposo" if "CULPOS" in base_completa else "Doloso"
 
-    # 5. Classificação: Simples vs Qualificado
-    modalidade = (
-        "Qualificado"
-        if any(t in texto_assuntos for t in ["QUALIFICAD", "MAJORAD", "HEDIONDO"])
-        else "Simples"
-    )
+    # 5. Modalidade (Qualificado vs Simples)
+    modalidade = "Qualificado" if "QUALIFICAD" in base_completa else "Simples"
 
     # 6. Lista de Crimes Imperdoáveis (Risco direto à vida, liberdade ou ao patrimônio/frota)
     crimes_imperdoaveis = [
-        # Contra a vida, integridade física grave e liberdade
         "HOMICIDIO", "FEMINICIDIO", "LATROCINIO", "SEQUESTRO", "CARCERE PRIVADO",
         "EXTORSAO MEDIANTE SEQUESTRO", "LESAO CORPORAL GRAVE", "LESAO CORPORAL GRAVISSIMA",
-        "ESTUPRO",
-        # Contra o patrimônio e fraudes veiculares (risco direto às motos)
-        "ROUBO", "FURTO", "ESTELIONATO", "APROPRIACAO INDEBITA",
+        "ESTUPRO", "ROUBO", "FURTO", "ESTELIONATO", "APROPRIACAO INDEBITA",
         "RECEPTACAO", "EXTORSAO", "ADULTERACAO DE SINAL IDENTIFICADOR",
-        # Alta periculosidade, armamento e tráfico
         "TRAFICO DE DROGAS", "ORGANIZACAO CRIMINOSA", "ASSOCIACAO CRIMINOSA",
         "PORTE ILEGAL DE ARMA", "POSSE IRREGULAR DE ARMA", "LAVAGEM DE DINHEIRO"
     ]
 
-    
     eh_crime_imperdoavel = (
         (elemento_subjetivo == "Doloso" and any(c in texto_assuntos for c in crimes_imperdoaveis))
         or modalidade == "Qualificado"
@@ -455,21 +433,20 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         decisao = "APONTAMENTO"
         motivo_regra = f"Ocorrência fora da lista de crimes graves ({assunto_principal}) — gerado apontamento para análise"
 
+    # 10. Montagem do resumo e retorno
+    resumo_classificacao = f"{assunto_principal} ({natureza} | {elemento_subjetivo} | {modalidade})"
+
     return {
         "ignorar": False,
-        "numero_processo": proc.get("numeroProcessoUnico", "N/A"),
-        "tribunal": proc.get("tribunal", "N/A"),
-        "crime_principal": assunto_principal,
-        "responsabilidade": papel_desc,
+        "assunto": assunto_principal,
         "natureza": natureza,
         "elemento_subjetivo": elemento_subjetivo,
         "modalidade": modalidade,
-        "lei_9099": eh_lei_9099,
+        "resumo_classificacao": resumo_classificacao,
+        "status_processo": status_proc or "EM TRAMITACAO",
         "anos_decorridos": anos_decorridos,
-        "status_processo": status_proc or "N/A",
         "decisao": decisao,
         "motivo_regra": motivo_regra,
-        "resumo_classificacao": resumo_classificacao,
     }
 
 def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
