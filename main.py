@@ -298,14 +298,26 @@ def extrair_processos_unicos(dados_data: dict) -> list:
     return processos
 
 
+def extrair_texto_campo(obj, chave: str, padrao: str = "") -> str:
+    """Lê uma chave se obj for dict, ou retorna o próprio texto se obj vier como str."""
+    if isinstance(obj, dict):
+        return str(obj.get(chave) or padrao)
+    if isinstance(obj, str):
+        return obj
+    return padrao
+
+
 def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
     """
     Classifica processos criminais com base na Tabela Unificada do CNJ,
     separando crimes imperdoáveis de apontamentos (Lei 9.099 / >5 anos).
     """
-    # 1. Verifica se o consultado figura no polo passivo (réu/indiciado/investigado)
+    if not isinstance(proc, dict):
+        return {"ignorar": True}
+
+    # 1. Verifica se o consultado figura no polo passivo
     infos_parte = proc.get("informacoesPartePessoaConsultada") or []
-    tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or [])]
+    tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or []) if isinstance(t, str)]
 
     polos_passivos = {
         "PASSIVO", "REU", "INDICIADO", "INVESTIGADO",
@@ -315,8 +327,15 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
     eh_vitima_ou_outro = False
 
     for info in infos_parte:
-        polo = normalizar_texto(info.get("polo", ""))
-        tipo = normalizar_texto(info.get("tipo", ""))
+        if isinstance(info, dict):
+            polo = normalizar_texto(info.get("polo", ""))
+            tipo = normalizar_texto(info.get("tipo", ""))
+        elif isinstance(info, str):
+            polo = normalizar_texto(info)
+            tipo = polo
+        else:
+            continue
+
         if polo == "PASSIVO" or tipo in polos_passivos:
             eh_passivo = True
         elif polo == "ATIVO" or tipo in {"VITIMA", "TESTEMUNHA", "OFENDIDO", "NOTICIANTE"}:
@@ -328,24 +347,43 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
     if not eh_passivo and eh_vitima_ou_outro:
         return {"ignorar": True}
 
-    # 2. Extração dos assuntos CNJ, classe e órgão julgador
+    # 2. Extração segura dos assuntos CNJ, classe e órgão julgador
     assuntos = proc.get("assuntosCNJ") or []
-    titulos_assuntos = [normalizar_texto(a.get("titulo", "")) for a in assuntos if a.get("titulo")]
-    codigos_assuntos = {str(a.get("codigo", "")).strip() for a in assuntos if a.get("codigo")}
+    titulos_assuntos = []
+    codigos_assuntos = set()
+    assunto_principal = None
 
-    assunto_principal = next(
-        (a.get("titulo") for a in assuntos if a.get("principal") and a.get("titulo")),
-        (assuntos[0].get("titulo") if assuntos else None)
-        or (proc.get("classeProcessual") or {}).get("nome")
-        or "Assunto não especificado",
-    )
+    for a in assuntos:
+        if isinstance(a, dict):
+            titulo = a.get("titulo")
+            if titulo:
+                titulos_assuntos.append(normalizar_texto(titulo))
+                if a.get("principal") and not assunto_principal:
+                    assunto_principal = str(titulo)
+            if a.get("codigo"):
+                codigos_assuntos.add(str(a.get("codigo")).strip())
+        elif isinstance(a, str) and a.strip():
+            titulos_assuntos.append(normalizar_texto(a))
+            if not assunto_principal:
+                assunto_principal = a.strip()
 
-    classe_nome = normalizar_texto((proc.get("classeProcessual") or {}).get("nome", ""))
-    orgao_julgador = normalizar_texto((proc.get("orgaoJulgador") or {}).get("nome", ""))
+    classe_raw = extrair_texto_campo(proc.get("classeProcessual"), "nome")
+    orgao_raw = extrair_texto_campo(proc.get("orgaoJulgador"), "nome")
+
+    if not assunto_principal:
+        if assuntos and isinstance(assuntos[0], dict) and assuntos[0].get("titulo"):
+            assunto_principal = str(assuntos[0]["titulo"])
+        elif assuntos and isinstance(assuntos[0], str):
+            assunto_principal = assuntos[0]
+        else:
+            assunto_principal = classe_raw or "Assunto não especificado"
+
+    classe_nome = normalizar_texto(classe_raw)
+    orgao_julgador = normalizar_texto(orgao_raw)
     texto_assuntos = " | ".join(titulos_assuntos) if titulos_assuntos else normalizar_texto(assunto_principal)
     base_completa = f"{texto_assuntos} {classe_nome} {orgao_julgador}"
 
-    # 3. Classificação da Natureza Jurídica (apenas para exibição no relatório)
+    # 3. Classificação da Natureza Jurídica
     termos_pessoa = [
         "CONTRA A PESSOA", "HOMICIDIO", "FEMINICIDIO", "LESAO CORPORAL",
         "AMEACA", "CALUNIA", "INJURIA", "DIFAMACAO", "SEQUESTRO",
@@ -363,13 +401,11 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
     else:
         natureza = "Outros Bens Jurídicos"
 
-    # 4. Elemento Subjetivo (Doloso vs Culposo)
+    # 4. Elemento Subjetivo e Modalidade
     elemento_subjetivo = "Culposo" if "CULPOS" in base_completa else "Doloso"
-
-    # 5. Modalidade (Qualificado vs Simples)
     modalidade = "Qualificado" if "QUALIFICAD" in base_completa else "Simples"
 
-    # 6. Lista de Crimes Imperdoáveis (Risco direto à vida, liberdade ou ao patrimônio/frota)
+    # 5. Lista de Crimes Imperdoáveis
     crimes_imperdoaveis = [
         "HOMICIDIO", "FEMINICIDIO", "LATROCINIO", "SEQUESTRO", "CARCERE PRIVADO",
         "EXTORSAO MEDIANTE SEQUESTRO", "LESAO CORPORAL GRAVE", "LESAO CORPORAL GRAVISSIMA",
@@ -384,7 +420,7 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         or modalidade == "Qualificado"
     )
 
-    # 7. Verificação Lei nº 9.099/1995 (Infração de Menor Potencial Ofensivo)
+    # 6. Verificação Lei nº 9.099/1995
     eh_lei_9099 = (
         not eh_crime_imperdoavel
         and (
@@ -397,10 +433,9 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         )
     )
 
-    # 8. Verificação Temporal (> 5 anos) e Status (Extinto / Encerrado)
-    status_pj = proc.get("statusPj") or {}
-    status_proc = normalizar_texto(status_pj.get("statusProcesso", ""))
-    status_obs = normalizar_texto(proc.get("statusObservacao", ""))
+    # 7. Verificação Temporal (> 5 anos) e Status
+    status_proc = normalizar_texto(extrair_texto_campo(proc.get("statusPj"), "statusProcesso"))
+    status_obs = normalizar_texto(str(proc.get("statusObservacao") or ""))
     status_unificado = f"{status_proc} {status_obs}".strip()
 
     termos_encerrado = [
@@ -412,11 +447,11 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         and "TRAMITACAO" not in status_unificado
     )
 
-    data_ref = parse_data_flexivel(proc.get("dataDistribuicao") or proc.get("dataAutuacao") or "")
+    data_ref = parse_data_flexivel(str(proc.get("dataDistribuicao") or proc.get("dataAutuacao") or ""))
     anos_decorridos = round((datetime.now() - data_ref).days / 365.25, 1) if data_ref else 0.0
     mais_de_5_anos = anos_decorridos > 5.0
 
-    # 9. Decisão Final da Matriz Jurídica
+    # 8. Decisão Final
     if eh_crime_imperdoavel:
         decisao = "REPROVADO"
         if mais_de_5_anos and esta_encerrado:
@@ -433,7 +468,6 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         decisao = "APONTAMENTO"
         motivo_regra = f"Ocorrência fora da lista de crimes graves ({assunto_principal}) — gerado apontamento para análise"
 
-    # 10. Montagem do resumo e retorno
     resumo_classificacao = f"{assunto_principal} ({natureza} | {elemento_subjetivo} | {modalidade})"
 
     return {
@@ -449,14 +483,17 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         "motivo_regra": motivo_regra,
     }
 
+
 def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
     """
     Analisa processos cíveis para identificar polo passivo, status ativo
     e registros de Alienação Fiduciária distribuídos há menos de 5 anos.
     """
-    status_pj = proc.get("statusPj") or {}
-    status_proc = normalizar_texto(status_pj.get("statusProcesso", ""))
-    status_obs = normalizar_texto(proc.get("statusObservacao", ""))
+    if not isinstance(proc, dict):
+        return {"esta_arquivado": True, "eh_passivo": False, "apontar_alienacao": False, "descricao_alienacao": None}
+
+    status_proc = normalizar_texto(extrair_texto_campo(proc.get("statusPj"), "statusProcesso"))
+    status_obs = normalizar_texto(str(proc.get("statusObservacao") or ""))
     status_unificado = f"{status_proc} {status_obs}".strip()
 
     esta_arquivado = (
@@ -464,17 +501,23 @@ def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
         and "TRAMITACAO" not in status_unificado
     )
 
-    # 1. Verifica se o consultado está no polo passivo (réu/devedor/requerido)
     infos_parte = proc.get("informacoesPartePessoaConsultada") or []
-    tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or [])]
+    tipos_parte = [normalizar_texto(t) for t in (proc.get("tipoPartePessoaConsultada") or []) if isinstance(t, str)]
 
     polos_passivos = {"PASSIVO", "REU", "EXECUTADO", "REQUERIDO", "DEVEDOR", "DEMANDADO"}
     eh_passivo = False
     eh_somente_ativo = False
 
     for info in infos_parte:
-        polo = normalizar_texto(info.get("polo", ""))
-        tipo = normalizar_texto(info.get("tipo", ""))
+        if isinstance(info, dict):
+            polo = normalizar_texto(info.get("polo", ""))
+            tipo = normalizar_texto(info.get("tipo", ""))
+        elif isinstance(info, str):
+            polo = normalizar_texto(info)
+            tipo = polo
+        else:
+            continue
+
         if polo == "PASSIVO" or tipo in polos_passivos:
             eh_passivo = True
         elif polo == "ATIVO":
@@ -483,9 +526,10 @@ def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
     if not eh_passivo and any(t in polos_passivos for t in tipos_parte):
         eh_passivo = True
 
-    
     if not eh_passivo and not eh_somente_ativo and not infos_parte and not tipos_parte:
         for parte in (proc.get("partes") or []):
+            if not isinstance(parte, dict):
+                continue
             doc_parte = "".join(filter(str.isdigit, str(parte.get("cpf", ""))))
             if doc_parte == cpf_consultado:
                 polo_p = normalizar_texto(parte.get("polo", ""))
@@ -495,36 +539,48 @@ def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
                 elif polo_p == "ATIVO":
                     eh_somente_ativo = True
 
-    # 2. Verifica Alienação Fiduciária
     assuntos = proc.get("assuntosCNJ") or []
-    titulos_assuntos = [normalizar_texto(a.get("titulo", "")) for a in assuntos if a.get("titulo")]
-    codigos_assuntos = {str(a.get("codigo", "")).strip() for a in assuntos if a.get("codigo")}
-    classe_nome = normalizar_texto((proc.get("classeProcessual") or {}).get("nome", ""))
+    titulos_assuntos = []
+    codigos_assuntos = set()
+    assunto_princ = None
+
+    for a in assuntos:
+        if isinstance(a, dict):
+            titulo = a.get("titulo")
+            if titulo:
+                titulos_assuntos.append(normalizar_texto(titulo))
+                if a.get("principal") and not assunto_princ:
+                    assunto_princ = str(titulo)
+            if a.get("codigo"):
+                codigos_assuntos.add(str(a.get("codigo")).strip())
+        elif isinstance(a, str) and a.strip():
+            titulos_assuntos.append(normalizar_texto(a))
+            if not assunto_princ:
+                assunto_princ = a.strip()
+
+    classe_raw = extrair_texto_campo(proc.get("classeProcessual"), "nome")
+    classe_nome = normalizar_texto(classe_raw)
 
     texto_busca = f"{' | '.join(titulos_assuntos)} {classe_nome}"
-    codigos_alienacao = {"9582", "10435"}  # Códigos CNJ de Alienação Fiduciária / Busca e Apreensão
+    codigos_alienacao = {"9582", "10435"}
 
     tem_termo_alienacao = (
         "ALIENACAO FIDUCIARIA" in texto_busca
         or bool(codigos_assuntos.intersection(codigos_alienacao))
     )
 
-    data_ref = parse_data_flexivel(proc.get("dataDistribuicao") or proc.get("dataAutuacao") or "")
+    data_ref = parse_data_flexivel(str(proc.get("dataDistribuicao") or proc.get("dataAutuacao") or ""))
     anos_decorridos = round((datetime.now() - data_ref).days / 365.25, 1) if data_ref else 0.0
     menos_de_5_anos = anos_decorridos < 5.0
 
-    # Gera apontamento se for Alienação Fiduciária < 5 anos e o cliente não for apenas o credor/autor
     apontar_alienacao = tem_termo_alienacao and menos_de_5_anos and (eh_passivo or not eh_somente_ativo)
 
     descricao_alienacao = None
     if apontar_alienacao:
-        assunto_princ = next(
-            (a.get("titulo") for a in assuntos if a.get("principal") and a.get("titulo")),
-            (proc.get("classeProcessual") or {}).get("nome") or "Alienação Fiduciária",
-        )
+        titulo_final = assunto_princ or classe_raw or "Alienação Fiduciária"
         status_legivel = status_proc or "EM TRAMITACAO"
         descricao_alienacao = (
-            f"Alienação Fiduciária (< 5 anos): {assunto_princ} "
+            f"Alienação Fiduciária (< 5 anos): {titulo_final} "
             f"({anos_decorridos} anos • {status_legivel})"
         )
 
@@ -534,7 +590,6 @@ def analisar_processo_civel(proc: dict, cpf_consultado: str) -> dict:
         "apontar_alienacao": apontar_alienacao,
         "descricao_alienacao": descricao_alienacao,
     }
-
 
 @app.post("/analisar-cpf/")
 async def analisar_cpf_endpoint(
@@ -724,8 +779,10 @@ async def analisar_cpf_endpoint(
     tem_polo_passivo_civel = False
 
     for proc in todos_processos:
-        area = normalizar_texto(proc.get("area", ""))
-        ramo = normalizar_texto((proc.get("statusPj") or {}).get("ramoDireito", ""))
+        if not isinstance(proc, dict):
+            continue
+        area = normalizar_texto(str(proc.get("area") or ""))
+        ramo = normalizar_texto(extrair_texto_campo(proc.get("statusPj"), "ramoDireito"))
 
         eh_criminal = "CRIMINAL" in area or "PENAL" in ramo
 
