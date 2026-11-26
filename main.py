@@ -425,7 +425,7 @@ def classificar_processo_criminal(proc: dict, cpf_consultado: str) -> dict:
         "ESTUPRO", "ROUBO", "FURTO", "ESTELIONATO", "APROPRIACAO INDEBITA",
         "RECEPTACAO", "EXTORSAO", "ADULTERACAO DE SINAL IDENTIFICADOR",
         "TRAFICO DE DROGAS", "ORGANIZACAO CRIMINOSA", "ASSOCIACAO CRIMINOSA",
-        "PORTE ILEGAL DE ARMA", "POSSE IRREGULAR DE ARMA", "LAVAGEM DE DINHEIRO"
+        "PORTE ILEGAL DE ARMA", "POSSE IRREGULAR DE ARMA"
     ]
 
     eh_crime_imperdoavel = (
@@ -710,7 +710,7 @@ async def analisar_cpf_endpoint(
         "LOCAC", "LOCADOR", "ALUG", "RENT A CAR", "RENTACAR", "FROTAS", "MOBILIDADE",
         "MOTTU", "LOCALIZA", "MOVIDA", "UNIDAS", "VAMOS", "TURBI", "KAVAK",
         "VOU DE MOTO", "VOUDEMOTO", "RAPI", "LEVE MOTOS", "MOTO FACIL", "MOTOFACIL",
-        "LOCA SIM", "LOCASIM", "LOCA9", "MOTOCA", "HERTZ", "AVIS", "BUDGET"
+        "LOCA SIM", "LOCASIM", "LOCA9", "MOTOCA", "HERTZ", "AVIS", "BUDGET", "SX LOC"
     ]
     divida_nu = 0.0
     lista_pendencias = consulta_credito.get("pendenciasFinanceiras") or []
